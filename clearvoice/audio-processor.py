@@ -4,288 +4,237 @@ import argparse
 import librosa
 import numpy as np
 import subprocess
+import time
 
 def convert_to_wav_mono(input_file, output_file, target_sr):
     """
-    将输入音频文件转换为单声道 WAV 格式，并使用原音频的采样率。
-
-    参数:
-    ----------
-    input_file (str): 原始音频文件路径。
-    output_file (str): 转换后的 WAV 文件路径。
-    target_sr (int): 目标采样率，通常取原音频文件的采样率。
-    
-    返回:
-    -------
-    bool: 如果转换成功则返回 True，否则返回 False。
+    将输入音频文件转换为单声道 WAV 格式，并使用目标采样率 target_sr
     """
+    print(f"[convert_to_wav_mono] 准备将 {input_file} 转换为单声道 WAV, 采样率={target_sr}")
     try:
-        # 使用 ffmpeg 将音频转换为单声道 WAV，采样率与输入文件一致
         ffmpeg_cmd = [
-            'ffmpeg', '-y',              # 覆盖输出文件
-            '-i', input_file,            # 输入文件
-            '-ac', '1',                  # 设置为单声道
-            '-ar', str(target_sr),       # 使用原音频文件的采样率
-            output_file                  # 输出文件
+            'ffmpeg', '-y',
+            '-i', input_file,
+            '-ac', '1',                  # 单声道
+            '-ar', str(target_sr),       # 目标采样率
+            output_file
         ]
+        print("[convert_to_wav_mono] ffmpeg 命令:", " ".join(ffmpeg_cmd))
+        start_time = time.time()
         result = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
         if result.returncode != 0:
-            print(f"FFmpeg 转换失败: {result.stderr.decode()}")
+            print(f"[convert_to_wav_mono] FFmpeg 转换失败: {result.stderr.decode()}")
             return False
+        
+        print(f"[convert_to_wav_mono] 转换成功！耗时 {time.time() - start_time:.2f} 秒")
         return True
     except Exception as e:
-        print(f"转换音频时发生错误: {e}")
+        print(f"[convert_to_wav_mono] 转换音频时发生错误: {e}")
         return False
 
 def get_audio_info(file_path):
     """
-    获取音频文件的信息，包括采样率、比特率和时长。
-
-    参数:
-    ----------
-    file_path (str): 音频文件路径。
-    
-    返回:
-    -------
-    dict: 包含采样率（sample_rate）、比特率（bit_rate）和时长（duration）的字典。
+    获取音频文件的信息，包括采样率、比特率和时长
     """
+    if not os.path.isfile(file_path):
+        print(f"[get_audio_info] 文件不存在: {file_path}")
+        return None
+
     try:
-        # librosa.load 默认读取整个音频，并返回音频数据 y 和采样率 sr
-        y, sr = librosa.load(file_path, sr=None, mono=True)
-        duration = librosa.get_duration(y=y, sr=sr)
-        
+        import soundfile as sf
+        with sf.SoundFile(file_path) as sfile:
+            sr = sfile.samplerate
+            channels = sfile.channels
+            frames = len(sfile)
+        duration_s = frames / sr if sr > 0 else 0
+
         file_size = os.path.getsize(file_path)
-        if duration > 0:
-            bit_rate = int(round((file_size * 8) / duration / 1000))
-        else:
-            bit_rate = 0
-        
+        bit_rate = 0
+        if duration_s > 0:
+            bit_rate = int(round((file_size * 8) / duration_s / 1000))
+
         return {
             'sample_rate': sr,
             'bit_rate': bit_rate,
-            'duration': duration
+            'duration': duration_s,
+            'channels': channels
         }
     except Exception as e:
-        print(f"警告: 无法获取音频信息: {e}")
+        print(f"[get_audio_info] 使用 soundfile 读取失败，尝试 librosa.load: {e}")
+
+    # 如果 soundfile 失败，fallback 到 librosa.load
+    try:
+        import librosa
+        y, sr = librosa.load(file_path, sr=None, mono=False)
+        duration_s = librosa.get_duration(y=y, sr=sr)
+        file_size = os.path.getsize(file_path)
+        if duration_s > 0:
+            bit_rate = int(round((file_size * 8) / duration_s / 1000))
+        else:
+            bit_rate = 0
+
+        channels = 1 if y.ndim == 1 else y.shape[0]
+        return {
+            'sample_rate': sr,
+            'bit_rate': bit_rate,
+            'duration': duration_s,
+            'channels': channels
+        }
+    except Exception as e2:
+        print(f"[get_audio_info] 再次读取失败: {e2}")
         return None
 
-def save_audio(wav_data, sr, output_path, target_bit_rate):
+def save_wav(wav_data, sr, output_path):
     """
-    将音频数据保存为 MP3 文件，指定比特率。
-
-    参数:
-    ----------
-    wav_data (numpy.ndarray): 音频数据。
-    sr (int): 采样率。
-    output_path (str): 输出文件路径。
-    target_bit_rate (int): 目标比特率（kbps）。
-    
-    返回:
-    -------
-    bool: 如果保存成功则返回 True，否则返回 False。
+    使用 ffmpeg 将处理后的音频数据（float32，单声道）保存为 .wav 格式 (16bit PCM)。
+    确保输出采样率与指定的 sr 一致。
     """
+    print(f"[save_wav] 准备将增强后的数据写入 {output_path} (采样率={sr})")
     try:
-        # 确保音频数据为 float32 并在 [-1, 1] 范围内
+        # 确保音频数据在 [-1,1]，类型为 float32
         wav_data = np.array(wav_data, dtype=np.float32)
-        wav_data = np.clip(wav_data, -1, 1)
-        
-        # 创建 ffmpeg 命令
+        wav_data = np.clip(wav_data, -1.0, 1.0)
+
         ffmpeg_cmd = [
             'ffmpeg', '-y',
-            '-f', 'f32le',           # 输入格式（32位浮点）
-            '-ar', str(sr),          # 采样率
-            '-ac', '1',              # 单声道
-            '-i', 'pipe:0',          # 从标准输入读取
-            '-c:a', 'libmp3lame',    # MP3 编码器
-            '-b:a', f'{target_bit_rate}k',  # 目标比特率
-            '-ar', str(sr),          # 输出采样率
+            '-f', 'f32le',       # 输入数据格式：32位浮点
+            '-ar', str(sr),      # 输入采样率
+            '-ac', '1',          # 输入1声道
+            '-i', 'pipe:0',      # 从 pipe 读取
+            '-c:a', 'pcm_s16le', # 输出 WAV (16-bit PCM)
+            '-ar', str(sr),      # 输出采样率
+            '-af', 'aresample=resampler=soxr',  # 使用高质量重采样器
             output_path
         ]
-        
-        # 启动 ffmpeg 进程
+        print("[save_wav] ffmpeg 命令:", " ".join(ffmpeg_cmd))
+        start_time = time.time()
         process = subprocess.Popen(
             ffmpeg_cmd,
             stdin=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
-        
-        # 将音频数据写入 ffmpeg 的标准输入
+
         process.stdin.write(wav_data.tobytes())
         process.stdin.close()
-        
-        # 等待进程完成
+
         stderr = process.stderr.read()
         process.stderr.close()
         process.wait()
-        
+
         if process.returncode != 0:
-            print(f"FFmpeg 警告: {stderr.decode()}")
+            print(f"[save_wav] FFmpeg 警告: {stderr.decode()}")
             return False
+
+        print(f"[save_wav] 保存成功！耗时 {time.time() - start_time:.2f} 秒")
         return True
     except Exception as e:
-        print(f"保存音频时发生错误: {e}")
+        print(f"[save_wav] 保存 WAV 文件时发生错误: {e}")
         return False
 
-def process_audio(input_file, output_dir=None, target_bit_rate=None, preserve_quality=True):
+def process_audio(input_file, output_dir=None):
     """
-    使用 ClearVoice 对音频文件进行增强处理。
-
-    参数:
-    ----------
-    input_file (str): 输入音频文件路径。
-    output_dir (str, optional): 输出目录。如果为 None，则使用输入文件所在目录。
-    target_bit_rate (int, optional): 目标比特率（kbps）。如果为 None，根据是否保留质量自动选择。
-    preserve_quality (bool): 是否保留或提升原始质量。
-    
-    返回:
-    -------
-    str: 增强后的音频文件路径。
+    音频处理流程：
+    1) 获取输入音频信息
+    2) 根据音频情况，直接转换到模型所需格式
+    3) 执行模型推理
+    4) 保存结果
     """
     if not os.path.exists(input_file):
         raise FileNotFoundError(f"输入文件未找到: {input_file}")
-    
-    # 先获取输入文件（可能是mp3、aac等）的信息
+
+    print("[process_audio] Step1: 分析输入音频")
     audio_info = get_audio_info(input_file)
     if not audio_info:
         raise ValueError("无法分析输入音频文件。")
-    
-    original_sr = audio_info['sample_rate']
-    print(f"原始音频信息:")
-    print(f"采样率: {audio_info['sample_rate']} Hz")
-    print(f"比特率: {audio_info['bit_rate']} kbps")
-    print(f"时长: {audio_info['duration']:.2f} 秒")
 
-    # 设置转换后的临时 WAV 文件路径
-    base, ext = os.path.splitext(input_file)
-    wav_mono_path = base + '_mono.wav'
+    print(f"[process_audio] 输入音频信息:\n"
+          f"  采样率: {audio_info['sample_rate']} Hz\n"
+          f"  通道数: {audio_info['channels']}\n"
+          f"  比特率: {audio_info['bit_rate']} kbps\n"
+          f"  时长  : {audio_info['duration']:.2f} 秒")
 
-    # 如果输入文件不是 WAV，或其通道数不是 1（单声道），则转换
-    # 此处不检测声道数（如想更严谨，可扩展 get_audio_info 来获取声道数），
-    # 简化起见，若不是 WAV 就先统一转换。
-    if ext.lower() != '.wav':
-        print("正在将输入音频转换为单声道 WAV 格式...")
-        success = convert_to_wav_mono(input_file, wav_mono_path, original_sr)
-        if not success:
-            raise ValueError("音频格式转换失败。请检查输入文件。")
-    else:
-        # 如果已经是 wav 格式，也要确保是单声道、并且采样率和原始一致，
-        # 这里直接转换一次以简化逻辑（根据需求也可先判断是否真的需要转换）
-        print("已是 WAV 格式，但仍将检查/转换为单声道。")
-        success = convert_to_wav_mono(input_file, wav_mono_path, original_sr)
-        if not success:
-            raise ValueError("音频格式转换失败。请检查输入文件。")
-
-    # 读取新的单声道 WAV 文件的信息
-    mono_wav_info = get_audio_info(wav_mono_path)
-    if not mono_wav_info:
-        raise ValueError("无法分析转换后的 WAV 文件。")
-    
-    # 再次更新 original_sr，确保与转换后的文件保持一致
-    original_sr = mono_wav_info['sample_rate']
-    print(f"\n转换后（单声道 WAV）的音频信息:")
-    print(f"采样率: {mono_wav_info['sample_rate']} Hz")
-    print(f"比特率: {mono_wav_info['bit_rate']} kbps")
-    print(f"时长: {mono_wav_info['duration']:.2f} 秒")
-
-    # 确定目标比特率
-    if target_bit_rate is None:
-        if preserve_quality:
-            target_bit_rate = max(mono_wav_info['bit_rate'], 192)
-        else:
-            target_bit_rate = min(mono_wav_info['bit_rate'], 192)
-    
-    # 根据采样率和比特率选择适当的模型
-    if mono_wav_info['sample_rate'] >= 44100 or target_bit_rate >= 192:
+    # 根据输入采样率选择合适的模型
+    if audio_info['sample_rate'] >= 44100:
         enhance_model = 'MossFormer2_SE_48K'
+        model_sr = 48000
     else:
         enhance_model = 'FRCRN_SE_16K'
-    
-    print(f"\n使用增强模型: {enhance_model}")
-    print(f"目标比特率: {target_bit_rate} kbps")
-    
+        model_sr = 16000
+
+    print(f"\n[process_audio] Step2: 准备模型输入")
+    print(f"  选择模型: {enhance_model} (采样率={model_sr}Hz)")
+
     # 设置输出路径
     if output_dir is None:
-        output_dir = os.path.dirname(input_file)
+        output_dir = os.path.dirname(input_file) or '.'
     os.makedirs(output_dir, exist_ok=True)
-    
     base_name = os.path.splitext(os.path.basename(input_file))[0]
-    enhanced_path = os.path.join(output_dir, f"{base_name}_enhanced.mp3")
-    
-    # 初始化 ClearVoice 模型
-    print("\n初始化语音增强模型...")
+    enhanced_path = os.path.join(output_dir, f"{base_name}_enhanced.wav")
+
+    # 只在需要时转换格式
+    if (audio_info['channels'] != 1 or 
+        audio_info['sample_rate'] != model_sr or 
+        not input_file.lower().endswith('.wav')):
+        
+        from tempfile import gettempdir
+        model_input_path = os.path.join(gettempdir(), f"model_input_{os.path.basename(input_file)}.wav")
+        print(f"  转换音频格式: {audio_info['channels']}ch@{audio_info['sample_rate']}Hz -> 1ch@{model_sr}Hz")
+        
+        if not convert_to_wav_mono(input_file, model_input_path, model_sr):
+            raise RuntimeError("音频格式转换失败。")
+    else:
+        model_input_path = input_file
+        print("  输入音频格式符合要求，无需转换")
+
+    # 执行模型推理
+    print("\n[process_audio] Step3: 执行模型推理")
     cv_enhance = ClearVoice(task='speech_enhancement', model_names=[enhance_model])
-    
-    # 处理音频
-    print(f"正在增强音频: {os.path.basename(wav_mono_path)}")
-    enhanced_wav = cv_enhance(input_path=wav_mono_path, online_write=False)
-    
-    # 确定模型的采样率
-    model_sr = 48000 if enhance_model == 'MossFormer2_SE_48K' else 16000
-    
-    # 确保增强后的音频为 numpy 数组
+    start_time = time.time()
+    enhanced_data = cv_enhance(input_path=model_input_path, online_write=False)
+    print(f"  推理完成，耗时 {time.time() - start_time:.2f} 秒")
+
+    # 处理模型输出
+    if isinstance(enhanced_data, dict):
+        enhanced_wav = list(enhanced_data.values())[0]
+    else:
+        enhanced_wav = enhanced_data
     enhanced_wav = np.array(enhanced_wav)
     
-    # 计算预期的样本数
-    expected_length = int(len(enhanced_wav) * original_sr / model_sr)
-    
-    print(f"\n调试信息:")
-    print(f"原始采样率: {original_sr} Hz")
-    print(f"模型采样率: {model_sr} Hz")
-    print(f"增强后音频样本数: {len(enhanced_wav)}")
-    print(f"重采样后的预期样本数: {expected_length}")
-    
-    # 重采样以匹配原始采样率
-    if model_sr != original_sr:
-        enhanced_wav = librosa.resample(
-            enhanced_wav, 
-            orig_sr=model_sr,
-            target_sr=original_sr
-        )
-    
-    # 验证重采样后的样本数
-    actual_length = len(enhanced_wav)
-    print(f"重采样后的实际样本数: {actual_length}")
-    print(f"预期时长: {expected_length / original_sr:.2f} 秒")
-    print(f"实际时长: {actual_length / original_sr:.2f} 秒")
-    
-    # 保存增强后的音频
-    if save_audio(enhanced_wav, original_sr, enhanced_path, target_bit_rate):
-        print(f"\n处理完成！")
-        print(f"增强后的文件已保存至: {enhanced_path}")
-        
-        # 验证最终输出
-        final_info = get_audio_info(enhanced_path)
-        if final_info:
-            print(f"\n最终音频信息:")
-            print(f"采样率: {final_info['sample_rate']} Hz")
-            print(f"比特率: {final_info['bit_rate']} kbps")
-            print(f"时长: {final_info['duration']:.2f} 秒")
+    # 保存结果（使用模型输出的采样率）
+    print("\n[process_audio] Step4: 保存结果")
+    if save_wav(enhanced_wav, model_sr, enhanced_path):
+        result_info = get_audio_info(enhanced_path)
+        print("\n[process_audio] 处理完成！")
+        print(f"输出文件: {enhanced_path}")
+        if result_info:
+            print(f"输出音频信息:\n"
+                  f"  采样率: {result_info['sample_rate']} Hz\n"
+                  f"  通道数: {result_info['channels']}\n"
+                  f"  时长  : {result_info['duration']:.2f} 秒")
+
+            if result_info['sample_rate'] != model_sr:
+                print(f"警告：输出采样率({result_info['sample_rate']}Hz)与期望值({model_sr}Hz)不一致")
     else:
-        print("\n保存增强后的音频失败。")
-    
+        print("\n[process_audio] 保存输出文件失败")
+
     return enhanced_path
 
 def main():
-    parser = argparse.ArgumentParser(description='使用 ClearVoice 处理音频文件')
+    parser = argparse.ArgumentParser(description='音频增强处理工具')
     parser.add_argument('input', help='输入音频文件路径')
     parser.add_argument('--output-dir', help='输出目录（可选）')
-    parser.add_argument('--bit-rate', type=int, help='目标比特率（kbps，可选）')
-    parser.add_argument('--preserve-quality', action='store_true', 
-                       help='是否保留或提升原始质量')
-    
+    # 只保留必要的参数
     args = parser.parse_args()
-    
+
     try:
         process_audio(
-            args.input, 
-            args.output_dir,
-            args.bit_rate,
-            args.preserve_quality
+            input_file=args.input,
+            output_dir=args.output_dir
         )
     except Exception as e:
-        print(f"处理文件时发生错误: {e}")
+        print(f"[main] 处理文件时发生错误: {e}")
         exit(1)
-    
     exit(0)
 
 if __name__ == "__main__":
