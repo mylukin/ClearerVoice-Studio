@@ -133,13 +133,6 @@ def save_wav(wav_data, sr, output_path):
         return False
 
 def process_audio(input_file, output_dir=None):
-    """
-    音频处理流程：
-    1) 获取输入音频信息
-    2) 根据音频情况，直接转换到模型所需格式
-    3) 执行模型推理
-    4) 保存结果
-    """
     if not os.path.exists(input_file):
         raise FileNotFoundError(f"输入文件未找到: {input_file}")
 
@@ -154,16 +147,20 @@ def process_audio(input_file, output_dir=None):
           f"  比特率: {audio_info['bit_rate']} kbps\n"
           f"  时长  : {audio_info['duration']:.2f} 秒")
 
-    # 根据输入采样率选择合适的模型
+    # 选择模型
     if audio_info['sample_rate'] >= 44100:
         enhance_model = 'MossFormer2_SE_48K'
+        sr_model = 'MossFormer2_SR_48K'
         model_sr = 48000
     else:
         enhance_model = 'FRCRN_SE_16K'
+        sr_model = None  # 16K没有SR模型
         model_sr = 16000
 
-    print(f"\n[process_audio] Step2: 准备模型输入")
-    print(f"  选择模型: {enhance_model} (采样率={model_sr}Hz)")
+    print(f"\n[process_audio] Step2: 准备模型")
+    print(f"  选择降噪模型: {enhance_model} (采样率={model_sr}Hz)")
+    if sr_model:
+        print(f"  选择音质提升模型: {sr_model}")
 
     # 设置输出路径
     if output_dir is None:
@@ -171,54 +168,70 @@ def process_audio(input_file, output_dir=None):
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(input_file))[0]
     enhanced_path = os.path.join(output_dir, f"{base_name}_enhanced.wav")
+    final_path = os.path.join(output_dir, f"{base_name}_final.wav")
 
-    # 只在需要时转换格式
+    # 格式转换
     if (audio_info['channels'] != 1 or 
         audio_info['sample_rate'] != model_sr or 
         not input_file.lower().endswith('.wav')):
-        
         from tempfile import gettempdir
         model_input_path = os.path.join(gettempdir(), f"model_input_{os.path.basename(input_file)}.wav")
         print(f"  转换音频格式: {audio_info['channels']}ch@{audio_info['sample_rate']}Hz -> 1ch@{model_sr}Hz")
-        
         if not convert_to_wav_mono(input_file, model_input_path, model_sr):
             raise RuntimeError("音频格式转换失败。")
     else:
         model_input_path = input_file
         print("  输入音频格式符合要求，无需转换")
 
-    # 执行模型推理
-    print("\n[process_audio] Step3: 执行模型推理")
+    # 降噪处理
+    print("\n[process_audio] Step3: 执行降噪")
     cv_enhance = ClearVoice(task='speech_enhancement', model_names=[enhance_model])
     start_time = time.time()
     enhanced_data = cv_enhance(input_path=model_input_path, online_write=False)
-    print(f"  推理完成，耗时 {time.time() - start_time:.2f} 秒")
+    print(f"  降噪完成，耗时 {time.time() - start_time:.2f} 秒")
 
-    # 处理模型输出
     if isinstance(enhanced_data, dict):
         enhanced_wav = list(enhanced_data.values())[0]
     else:
         enhanced_wav = enhanced_data
     enhanced_wav = np.array(enhanced_wav)
     
-    # 保存结果（使用模型输出的采样率）
-    print("\n[process_audio] Step4: 保存结果")
-    if save_wav(enhanced_wav, model_sr, enhanced_path):
-        result_info = get_audio_info(enhanced_path)
-        print("\n[process_audio] 处理完成！")
-        print(f"输出文件: {enhanced_path}")
-        if result_info:
-            print(f"输出音频信息:\n"
-                  f"  采样率: {result_info['sample_rate']} Hz\n"
-                  f"  通道数: {result_info['channels']}\n"
-                  f"  时长  : {result_info['duration']:.2f} 秒")
+    # 保存降噪结果
+    if not save_wav(enhanced_wav, model_sr, enhanced_path):
+        print("\n[process_audio] 保存降噪文件失败")
+        return None
 
-            if result_info['sample_rate'] != model_sr:
-                print(f"警告：输出采样率({result_info['sample_rate']}Hz)与期望值({model_sr}Hz)不一致")
+    # 音质提升处理
+    if sr_model:
+        print("\n[process_audio] Step4: 执行音质提升")
+        cv_sr = ClearVoice(task='speech_super_resolution', model_names=[sr_model])
+        start_time = time.time()
+        sr_data = cv_sr(input_path=enhanced_path, online_write=False)
+        print(f"  音质提升完成，耗时 {time.time() - start_time:.2f} 秒")
+
+        if isinstance(sr_data, dict):
+            sr_wav = list(sr_data.values())[0]
+        else:
+            sr_wav = sr_data
+        sr_wav = np.array(sr_wav)
+        
+        # 保存最终结果
+        if save_wav(sr_wav, model_sr, final_path):
+            result_info = get_audio_info(final_path)
+            print("\n[process_audio] 处理完成！")
+            print(f"输出文件: {final_path}")
+            if result_info:
+                print(f"输出音频信息:\n"
+                      f"  采样率: {result_info['sample_rate']} Hz\n"
+                      f"  通道数: {result_info['channels']}\n"
+                      f"  时长  : {result_info['duration']:.2f} 秒")
+        else:
+            print("\n[process_audio] 保存最终文件失败")
+            return enhanced_path
+        return final_path
     else:
-        print("\n[process_audio] 保存输出文件失败")
-
-    return enhanced_path
+        print("\n[process_audio] 处理完成！(采样率较低，跳过音质提升)")
+        return enhanced_path
 
 def main():
     parser = argparse.ArgumentParser(description='音频增强处理工具')
